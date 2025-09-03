@@ -2,16 +2,21 @@
 set -euo pipefail
 
 # dev-server-manager installer for Amazon Linux (dnf)
-# - Installs system dependencies (docker, git, unzip, cronie, iproute)
+# - Installs system dependencies (docker, git, unzip, cronie, iproute, curl)
 # - Enables and starts docker and crond
 # - Ensures dev-server-manager/check_connections.sh is executable
-# - Installs a 5-minute user crontab entry to run check_connections.sh
-# - Grants $TARGET_USER passwordless permission to shutdown for cron
+# - Installs a 5-minute system cron entry (/etc/cron.d/dev-server-manager) to run check_connections.sh as root
+# - No sudo needed; intended for AWS User Data (runs as root)
 
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
 if [ -z "${HOME_DIR:-}" ]; then
   HOME_DIR="$(eval echo "~$TARGET_USER")"
+fi
+# Prefer the default Amazon Linux user when present (User Data runs as root)
+if getent passwd ec2-user >/dev/null 2>&1; then
+  TARGET_USER="ec2-user"
+  HOME_DIR="/home/ec2-user"
 fi
 
 PROJECT_DIR="$HOME_DIR/projects/dev-server-manager"
@@ -72,6 +77,12 @@ if [ -f "$GITIGNORE_PATH" ]; then
   fi
 fi
 
+# Adjust PROJECT_DIR/SCRIPT_PATH if repository exists under /home/ec2-user
+if [ ! -f "$SCRIPT_PATH" ] && [ -f "/home/ec2-user/projects/dev-server-manager/check_connections.sh" ]; then
+  PROJECT_DIR="/home/ec2-user/projects/dev-server-manager"
+  SCRIPT_PATH="$PROJECT_DIR/check_connections.sh"
+fi
+
 if [ ! -f "$SCRIPT_PATH" ]; then
   echo "[dev-server-manager] ERROR: Expected script not found at $SCRIPT_PATH"
   echo "[dev-server-manager] Ensure the repo is cloned at $PROJECT_DIR and rerun this installer."
@@ -82,36 +93,17 @@ echo "[dev-server-manager] Setting ownership and executable bit on $SCRIPT_PATH"
 chown "$TARGET_USER":"$TARGET_USER" "$SCRIPT_PATH" || true
 chmod +x "$SCRIPT_PATH"
 
-# Allow shutdown without password for the cron-executed user
-if [ "$(id -u)" -eq 0 ]; then
-  SUDOERS_FILE="/etc/sudoers.d/dev-server-manager"
-  if ! grep -q "$TARGET_USER" "$SUDOERS_FILE" 2>/dev/null; then
-    echo "$TARGET_USER ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown, /bin/systemctl poweroff, /usr/bin/systemctl poweroff" > "$SUDOERS_FILE"
-    chmod 440 "$SUDOERS_FILE"
-    echo "[dev-server-manager] Configured sudoers drop-in: $SUDOERS_FILE"
-  else
-    echo "[dev-server-manager] Sudoers drop-in already configured"
-  fi
-fi
+# Cron runs as root from /etc/cron.d; no sudoers modifications required
 
-# Install cron job for TARGET_USER without duplicates
-echo "[dev-server-manager] Installing 5-min cron job for $TARGET_USER (idempotent)..."
-if [ "$(id -u)" -eq 0 ]; then
-  EXISTING="$(crontab -u "$TARGET_USER" -l 2>/dev/null || true)"
-  if ! printf "%s\n" "$EXISTING" | grep -Fq "$SCRIPT_PATH"; then
-    printf "%s\n%s\n" "$EXISTING" "$CRON_LINE" | crontab -u "$TARGET_USER" -
-    echo "[dev-server-manager] Cron job installed for $TARGET_USER"
-  else
-    echo "[dev-server-manager] Cron job already present for $TARGET_USER"
-  fi
-else
-  EXISTING="$(crontab -l 2>/dev/null || true)"
-  if ! printf "%s\n" "$EXISTING" | grep -Fq "$SCRIPT_PATH"; then
-    printf "%s\n%s\n" "$EXISTING" "$CRON_LINE" | crontab -
-    echo "[dev-server-manager] Cron job installed for $TARGET_USER"
-  else
-    echo "[dev-server-manager] Cron job already present for $TARGET_USER"
-  fi
-fi
+# Install system cron via /etc/cron.d (idempotent)
+echo "[dev-server-manager] Installing 5-min system cron in /etc/cron.d/dev-server-manager..."
+CRON_FILE="/etc/cron.d/dev-server-manager"
+cat > "$CRON_FILE" <<EOF
+SHELL=/bin/bash
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /bin/bash $SCRIPT_PATH >> /var/log/dev-server-manager.cron.log 2>&1
+EOF
+chmod 644 "$CRON_FILE"
+echo "[dev-server-manager] System cron installed at $CRON_FILE"
 
 echo "[dev-server-manager] Installation complete."
